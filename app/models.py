@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 
 MAX_PERIODS = 200
 MAX_AUDIT_RECORDS = 2000
+MAX_BATCH_RECORDS = 200
 MIN_EFFICIENCY_EXCLUSIVE = 0.0
 MAX_EFFICIENCY_INCLUSIVE = 1.0
 
@@ -498,3 +499,124 @@ class ReplanResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# 可持久接续的执行会话
+# ---------------------------------------------------------------------------
+
+
+class SessionCreateRequest(BaseModel):
+    """创建执行会话：原 /dispatch 输入、完整计划快照与审计容差。"""
+
+    dispatch: DispatchRequest = Field(description="生成该计划时使用的完整 /dispatch 输入")
+    plan_snapshot: DispatchResponse = Field(
+        description="当初 /dispatch 返回的计划快照（periods + summary 原样提交），"
+        "服务端会重算并逐字段核对一致"
+    )
+    audit_tolerance_kwh: float = Field(
+        ge=0.0, description="审计容差（kWh），规则同 /telemetry/audit：残差绝对值严格大于它即判异常"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "SessionCreateRequest":
+        if not math.isfinite(self.audit_tolerance_kwh):
+            raise ValueError("audit_tolerance_kwh 必须是有限数值")
+        return self
+
+
+class ConfirmedRecord(BaseModel):
+    """已确认记录：原始实测记录 + 全局时段下标 + 入库时间。"""
+
+    index: int = Field(description="原计划时间轴上的时段下标（从 0 起）")
+    record: TelemetryRecord
+    stored_at: str = Field(description="该记录入库时间（UTC ISO 8601）")
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: str = Field(description="会话 ID（UUID）")
+    created_at: str = Field(description="会话创建时间（UTC ISO 8601）")
+    audit_tolerance_kwh: float
+    num_periods: int = Field(description="原计划时段总数，即可追加的下标范围 [0, num_periods)")
+    confirmed_periods: int = Field(description="已确认时段数（创建时恒为 0）")
+    next_index: int = Field(description="下一批应使用的起始下标（创建时恒为 0）")
+    status: Literal["awaiting_records", "in_progress", "complete"]
+    dispatch: DispatchRequest = Field(description="回显原 /dispatch 输入")
+    plan_snapshot: DispatchResponse = Field(description="回显已核对一致的计划快照")
+
+
+class BatchAppendRequest(BaseModel):
+    """按起始下标成批追加半小时实测记录。"""
+
+    start_index: int = Field(ge=0, description="本批首条记录在原时间轴上的下标，须等于会话 next_index")
+    records: Annotated[
+        List[TelemetryRecord], Field(min_length=1, max_length=MAX_BATCH_RECORDS)
+    ] = Field(description="本批半小时实测记录（按时间顺序，下标连续递增）")
+    # 记录的有限/非负/SOC 容量约束在服务层按会话所属计划的容量统一校验
+
+
+class BatchAuditRecord(TelemetryRecordAudit):
+    """批内逐条审计结论：index 为原时间轴全局下标。"""
+
+
+class BatchAppendResponse(BaseModel):
+    session_id: str
+    start_index: int = Field(description="本批起始下标（与请求一致）")
+    batch_size: int = Field(description="本批记录条数")
+    result: Literal["accepted", "deduped"] = Field(
+        description="accepted=新批次已入库；deduped=同起点同内容重试，原样返回既有结果"
+    )
+    confirmed_periods: int = Field(description="入库/已确认后会话的累计确认时段数")
+    next_index: int = Field(description="下一批应使用的起始下标")
+    status: Literal["awaiting_records", "in_progress", "complete"]
+    batch_audit: List[BatchAuditRecord] = Field(
+        description="本批记录的遥测审计逐条结论（deduped 时为已保存批次的同一审计结果）"
+    )
+    first_record_soc_gap_kwh: float = Field(
+        description="本批首态 SOC 与应有起点之差："
+        "首批接原初始 SOC，后续批接已保存末态（deduped 同样重算返回）"
+    )
+    final_soc_kwh: Optional[float] = Field(
+        description="截至本批的已确认末态 SOC（无记录时为 null）"
+    )
+
+
+class SessionSummary(BaseModel):
+    session_id: str
+    created_at: str
+    updated_at: Optional[str] = Field(description="最近一次成功入库时间（UTC ISO 8601），无记录为 null")
+    audit_tolerance_kwh: float
+    num_periods: int
+    confirmed_periods: int
+    next_index: int
+    status: Literal["awaiting_records", "in_progress", "complete"]
+    initial_soc_kwh: float = Field(description="原初始 SOC（首批首态须在容差内与之衔接）")
+    final_soc_kwh: Optional[float] = Field(description="已确认末态 SOC，无记录为 null")
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionSummary]
+
+
+class SessionDetailResponse(BaseModel):
+    """查询会话：原计划信息 + 连续已确认记录 + 下一下标。"""
+
+    session_id: str
+    created_at: str
+    updated_at: Optional[str]
+    audit_tolerance_kwh: float
+    num_periods: int
+    confirmed_periods: int
+    next_index: int
+    status: Literal["awaiting_records", "in_progress", "complete"]
+    dispatch: DispatchRequest = Field(description="原 /dispatch 输入，可直接用于续排/结算")
+    plan_snapshot: DispatchResponse = Field(description="已核对一致的原计划快照")
+    confirmed_records: List[ConfirmedRecord] = Field(
+        description="自下标 0 起连续已确认的实测记录（未完成前缀可用于 /dispatch/replan；"
+        "满期记录可用于 /dispatch/settlement）"
+    )
+    confirmed_audit: List[BatchAuditRecord] = Field(
+        description="对全部连续已确认记录重算的遥测审计（全局下标）"
+    )
+    initial_soc_kwh: float
+    final_soc_kwh: Optional[float]
