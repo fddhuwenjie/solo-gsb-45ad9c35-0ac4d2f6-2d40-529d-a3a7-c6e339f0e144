@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -13,12 +15,23 @@ from app.models import (
     ErrorResponse,
     ReplanRequest,
     ReplanResponse,
+    SessionAppendRequest,
+    SessionAppendResponse,
+    SessionCreateRequest,
+    SessionStateResponse,
     SettlementRequest,
     SettlementResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
 )
 from app.replan import ReplanError, execute_replan
+from app.session_store import DEFAULT_DB_PATH, SessionStore
+from app.sessions import (
+    SessionError,
+    append_records,
+    create_session,
+    get_session_state,
+)
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
 
@@ -32,9 +45,16 @@ app = FastAPI(
         "/dispatch/settlement 对已下发计划做执行结算：重算校验计划快照、"
         "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费；"
         "/dispatch/replan 支持计划执行中途依据连续实测前缀续排：核对原计划与前缀审计、"
-        "从实测末态重排余段，并给出可直接交给 /dispatch/settlement 的余段输入与快照。"
+        "从实测末态重排余段，并给出可直接交给 /dispatch/settlement 的余段输入与快照；"
+        "/dispatch/sessions 提供可持久接续的执行会话：创建时提交原 /dispatch 输入、"
+        "完整计划快照与审计容差（先重算核对快照），之后按时段下标成批追加实测记录"
+        "（沿用遥测审计逐段核对，首批首态接原初始 SOC、后续批次首态接已保存末态，"
+        "偏离计划但自洽仍接受；异常/下标跳跃/超范围整批拒绝），同一起点整批原样重试"
+        "返回既有结果、内容不同的并发上报仅一份生效；查询返回原计划信息、连续已确认"
+        "记录与下一下标，未完成前缀可续排、满期记录可结算；会话持久化于 SQLite，"
+        "进程重启后记录仍在。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -73,6 +93,14 @@ async def settlement_error_handler(request: Request, exc: SettlementError):
 async def replan_error_handler(request: Request, exc: ReplanError):
     return JSONResponse(
         status_code=422,
+        content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(SessionError)
+async def session_error_handler(request: Request, exc: SessionError):
+    return JSONResponse(
+        status_code=exc.http_status,
         content={"error": exc.code, "reason": str(exc)},
     )
 
@@ -177,3 +205,82 @@ async def dispatch_replan(req: ReplanRequest) -> ReplanResponse:
         remaining_pv_kw=req.remaining_pv_kw,
     )
     return ReplanResponse.model_validate(result)
+
+
+def _session_store() -> SessionStore:
+    """惰性构建会话存储：默认路径可用 SESSION_DB_PATH 覆盖；测试可替换 app.state。"""
+    store = getattr(app.state, "session_store", None)
+    if store is None:
+        store = SessionStore(os.environ.get("SESSION_DB_PATH", DEFAULT_DB_PATH))
+        app.state.session_store = store
+    return store
+
+
+@app.post(
+    "/dispatch/sessions",
+    response_model=SessionStateResponse,
+    status_code=201,
+    responses={422: {"model": ErrorResponse, "description": "非法输入、快照不符或原输入无解"}},
+    tags=["sessions"],
+)
+def create_execution_session(req: SessionCreateRequest) -> SessionStateResponse:
+    """创建执行会话：重算核对计划快照后，会话可按时段下标分批接续接收实测记录。
+
+    - 快照与重算不一致（plan_snapshot_mismatch）、原输入无解（infeasible）整体拒绝；
+    - 成功后返回 session_id 与初始状态（next_index=0），会话持久化保存。
+    """
+    result = create_session(
+        dispatch_input=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        audit_tolerance_kwh=req.audit_tolerance_kwh,
+        store=_session_store(),
+    )
+    return SessionStateResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/sessions/{session_id}/records",
+    response_model=SessionAppendResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        409: {"model": ErrorResponse, "description": "与已保存批次内容冲突"},
+        422: {"model": ErrorResponse, "description": "记录异常、下标跳跃或超出计划范围"},
+    },
+    tags=["sessions"],
+)
+def append_execution_records(
+    session_id: str, req: SessionAppendRequest
+) -> SessionAppendResponse:
+    """按时段下标成批追加实测记录：整批核对、整批入库。
+
+    - 沿用遥测审计逐段核对；首批首态接原初始 SOC、后续批次首态接已保存末态；
+      实测动作偏离计划但自洽时仍接受；
+    - 任一记录异常（batch_audit_failed）、下标跳跃（batch_index_gap）、
+      超出计划范围（batch_out_of_range）→ 整批不入库；
+    - 同一起点的已保存整批记录原样重试 → 返回既有结果；
+      内容不同 → 409 batch_conflict（并发上报仅一份生效）。
+    """
+    result = append_records(
+        session_id=session_id,
+        start_index=req.start_index,
+        records=req.records,
+        store=_session_store(),
+    )
+    return SessionAppendResponse.model_validate(result)
+
+
+@app.get(
+    "/dispatch/sessions/{session_id}",
+    response_model=SessionStateResponse,
+    responses={404: {"model": ErrorResponse, "description": "会话不存在"}},
+    tags=["sessions"],
+)
+def get_execution_session(session_id: str) -> SessionStateResponse:
+    """查询会话：原计划信息、连续已确认记录与下一待确认下标。
+
+    未完成前缀（ready_for_replan）可直接交给 /dispatch/replan 续排；
+    满期记录（ready_for_settlement）可直接交给 /dispatch/settlement 结算。
+    """
+    return SessionStateResponse.model_validate(
+        get_session_state(session_id, _session_store())
+    )

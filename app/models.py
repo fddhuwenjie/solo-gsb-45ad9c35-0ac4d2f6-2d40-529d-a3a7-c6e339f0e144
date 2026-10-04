@@ -495,6 +495,88 @@ class ReplanResponse(BaseModel):
     )
 
 
+class SessionCreateRequest(BaseModel):
+    """创建执行会话：原 /dispatch 输入、完整计划快照与审计容差。"""
+
+    dispatch: DispatchRequest = Field(description="生成该计划时使用的完整 /dispatch 输入")
+    plan_snapshot: DispatchResponse = Field(
+        description="当初 /dispatch 返回的计划快照（periods + summary），服务端会重算并核对"
+    )
+    audit_tolerance_kwh: float = Field(
+        ge=0.0,
+        description="审计容差（kWh），规则与 /telemetry/audit 一致：残差绝对值严格大于它即判异常",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "SessionCreateRequest":
+        if not math.isfinite(self.audit_tolerance_kwh):
+            raise ValueError("audit_tolerance_kwh 必须是有限数值")
+        return self
+
+
+class SessionAppendRequest(BaseModel):
+    """按时段下标成批追加半小时实测记录。"""
+
+    start_index: int = Field(
+        ge=0,
+        description="本批首条记录在原计划时间轴上的全局下标：须等于会话当前 next_index"
+        "（新批次），或等于某个已保存批次的起点（幂等重试）",
+    )
+    records: Annotated[
+        List[TelemetryRecord], Field(min_length=1, max_length=MAX_PERIODS)
+    ] = Field(description="本批半小时实测记录（字段同 /telemetry/audit），按时间顺序排列")
+
+
+class SessionStateResponse(BaseModel):
+    """执行会话状态：原计划信息、连续已确认记录与下一待确认下标。"""
+
+    session_id: str
+    created_at: str
+    status: Literal["open", "in_progress", "completed"] = Field(
+        description="open=尚无记录；in_progress=已确认连续前缀；completed=已覆盖全部计划时段"
+    )
+    num_periods: int = Field(description="原计划总时段数")
+    period_hours: float
+    audit_tolerance_kwh: float
+    dispatch: DispatchRequest = Field(description="创建会话时提交的原 /dispatch 输入")
+    plan_snapshot: DispatchResponse = Field(description="创建会话时提交的计划快照")
+    confirmed_periods: int = Field(description="连续已确认记录数（自下标 0 起）")
+    confirmed_records: List[TelemetryRecord] = Field(
+        description="连续已确认实测记录：可直接作为 /dispatch/replan 的 executed_records"
+        "（未完成前缀）或 /dispatch/settlement 的 records（满期）"
+    )
+    next_index: int = Field(description="下一批应使用的起始下标")
+    remaining_periods: int = Field(description="尚未确认的时段数")
+    initial_soc_kwh: float = Field(description="原初始 SOC（首批首态须接此值）")
+    last_soc_end_kwh: Optional[float] = Field(
+        description="已保存末态 SOC（后续批次首态须接此值；尚无记录时为 null）"
+    )
+    ready_for_replan: bool = Field(
+        description="存在未完成前缀（0 < 已确认 < 总时段），可接 /dispatch/replan 续排"
+    )
+    ready_for_settlement: bool = Field(
+        description="记录已满期（已确认 = 总时段），可接 /dispatch/settlement 结算"
+    )
+
+
+class SessionAppendResponse(BaseModel):
+    """批次追加结果（幂等重试返回与首次完全一致的内容）。"""
+
+    session_id: str
+    accepted: Literal[True]
+    start_index: int = Field(description="本批首条记录的全局下标")
+    num_records: int = Field(description="本批记录数")
+    records: List[TelemetryRecordAudit] = Field(
+        description="本批逐条审计结论（index 为原计划时间轴上的全局下标）"
+    )
+    confirmed_periods: int = Field(description="截至本批的连续已确认记录数")
+    next_index: int = Field(description="下一批应使用的起始下标")
+    last_soc_end_kwh: float = Field(description="已保存末态 SOC（下一批首态须接此值）")
+    num_periods: int
+    remaining_periods: int
+    status: Literal["in_progress", "completed"]
+
+
 class ErrorResponse(BaseModel):
     error: str
     reason: str

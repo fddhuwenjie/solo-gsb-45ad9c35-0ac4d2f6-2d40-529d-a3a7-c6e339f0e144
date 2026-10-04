@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照；`/dispatch/sessions` 提供**可持久接续的执行会话**：创建时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算核对快照），之后按时段下标**成批追加**半小时实测记录（沿用遥测审计逐段核对，首批首态接原初始 SOC、后续批次首态接已保存末态，偏离计划但自洽仍接受；异常 / 下标跳跃 / 超范围整批拒绝），同一起点整批原样重试返回既有结果、内容不同的并发上报仅一份生效；查询返回原计划信息、连续已确认记录与下一下标，未完成前缀可直接续排、满期记录可直接结算；会话持久化于 SQLite，进程重启后记录仍在。
 
 ## 一条命令启动
 
@@ -17,6 +17,8 @@ docker compose up --build
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
 
 停止：`Ctrl+C`（后台运行用 `docker compose up -d --build`，停止用 `docker compose down`）。
+
+执行会话持久化在 SQLite 文件（容器内 `/app/data/sessions.db`，Compose 已挂命名卷 `session-data`）：进程重启、容器重建后记录仍在；`docker compose down -v` 会连同数据卷一起删除。可用环境变量 `SESSION_DB_PATH` 覆盖数据库位置（裸机运行默认 `data/sessions.db`，相对工作目录）。
 
 本地裸机运行（Python 3.11+）：
 
@@ -545,6 +547,168 @@ curl -s -X POST http://localhost:8000/dispatch/replan \
 - `infeasible`：从实测末态出发，原末端 SOC 约束在余段新预测下已无法满足；
 - `invalid_input`：前缀为空 / 覆盖全周期、余段预测长度与剩余时段数不符、容差或测量值非法等。
 
+### `POST /dispatch/sessions`
+
+创建**执行会话**：实测记录分批到达时，用会话把同一份计划的执行过程可持久地接续起来。请求携带三样东西：
+
+| 字段 | 说明 |
+|---|---|
+| `dispatch` | 一次 `/dispatch` 的**完整输入**（电价/负荷/光伏序列 + 全部电池参数） |
+| `plan_snapshot` | 当初 `/dispatch` 返回的计划快照（`periods` + `summary` 原样回传） |
+| `audit_tolerance_kwh` | 审计容差（kWh，非负），规则与 `/telemetry/audit` 完全一致：残差绝对值**严格大于**它才判异常 |
+
+服务端**先重算并逐字段核对快照**（与结算同一套防篡改核对），不一致（`plan_snapshot_mismatch`）或原输入无解（`infeasible`）即拒绝。成功返回 **HTTP 201** 与初始会话状态（`session_id`、`next_index=0`、`status=open`），会话随即持久化保存。
+
+### `POST /dispatch/sessions/{session_id}/records`
+
+按时段下标**成批追加**半小时实测记录：
+
+| 字段 | 说明 |
+|---|---|
+| `start_index` | 本批首条记录在原计划时间轴上的全局下标：须等于会话当前 `next_index`（新批次），或等于某个已保存批次的起点（幂等重试） |
+| `records` | 本批半小时实测记录（字段同 `/telemetry/audit`），按时间顺序排列，1–200 条 |
+
+服务端核对规则：
+
+1. **遥测审计**：沿用 `/telemetry/audit` 的同一套核算逐条核对批内记录（电芯能量守恒、购电量平衡、批内相邻记录 SOC 衔接）；
+2. **批首衔接**：首批（`start_index=0`）首条首态 SOC 须在容差内接**原初始 SOC**；后续批次首条首态 SOC 须在容差内接**已保存末态 SOC**；
+3. **偏离计划但自洽 → 接受**：实测动作偏离原计划但记录自洽时照常入库（不做 SOC 断点判定）；
+4. **整批拒绝（HTTP 422，全部不入库）**：任一记录未通过审计（`batch_audit_failed`）、`start_index` 越过当前 `next_index` 即下标跳跃（`batch_index_gap`）、批次覆盖下标超出原计划范围（`batch_out_of_range`）；
+5. **幂等与冲突**：同一起点的已保存整批记录**原样重试** → 返回与首次完全一致的既有结果（不重复入库）；起点落在已确认区间且**内容不同** → **HTTP 409** `batch_conflict`（内容不同的并发上报只有一份生效，其余返回冲突）。
+
+响应（成功或幂等重试均为 HTTP 200）：`records` 为本批逐条审计结论（`index` 为全局下标），另含 `confirmed_periods`、`next_index`、`last_soc_end_kwh`、`status`（`in_progress` / `completed`）等会话进度。
+
+### `GET /dispatch/sessions/{session_id}`
+
+查询会话状态，返回：
+
+- **原计划信息**：`dispatch`、`plan_snapshot`、`audit_tolerance_kwh`、`num_periods`；
+- **连续已确认记录**：`confirmed_records`（自下标 0 起连续）与 `confirmed_periods`；
+- **进度**：`next_index`（下一批应使用的起始下标）、`remaining_periods`、`last_soc_end_kwh`、`status`（`open` / `in_progress` / `completed`）；
+- **衔接标记**：`ready_for_replan`（0 < 已确认 < 总时段）为真时，`confirmed_records` 可直接作为 `/dispatch/replan` 的 `executed_records`；`ready_for_settlement`（已确认 = 总时段）为真时，可直接作为 `/dispatch/settlement` 的 `records`。
+
+会话不存在返回 **HTTP 404** `session_not_found`。
+
+### 执行会话示例（创建 → 追加 → 重试 → 冲突 → 查询 → 结算/续排）
+
+```bash
+# 0. 准备调度输入（与 /dispatch 示例相同）
+cat > dispatch.json <<'JSON'
+{
+  "prices": [0.0, 1.0, 1.0, 0.0],
+  "base_load_kw": [0.2, 0.2, 0.2, 0.2],
+  "pv_kw": [0.0, 0.0, 0.0, 0.0],
+  "capacity_kwh": 0.4,
+  "max_charge_kw": 1.0,
+  "max_discharge_kw": 1.0,
+  "charge_efficiency": 0.9,
+  "discharge_efficiency": 0.9,
+  "initial_soc_kwh": 0.0,
+  "min_terminal_soc_kwh": 0.0,
+  "degradation_cost_per_kwh": 0.2
+}
+JSON
+
+# 1. 生成计划快照
+curl -s -X POST http://localhost:8000/dispatch \
+  -H 'Content-Type: application/json' -d @dispatch.json > plan.json
+
+# 2. 创建执行会话（服务端重算核对快照），记下 session_id
+python3 -c '
+import json
+body = {
+    "dispatch": json.load(open("dispatch.json")),
+    "plan_snapshot": json.load(open("plan.json")),
+    "audit_tolerance_kwh": 0.01,
+}
+open("session_create.json", "w").write(json.dumps(body))
+'
+SESSION_ID=$(curl -s -X POST http://localhost:8000/dispatch/sessions \
+  -H 'Content-Type: application/json' -d @session_create.json \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["session_id"])')
+
+# 3. 追加首批（下标 0 起，t0/t1 两段实测；首态 0.0 接原初始 SOC）
+curl -s -X POST "http://localhost:8000/dispatch/sessions/$SESSION_ID/records" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_index": 0,
+    "records": [
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.222222,
+       "discharge_ac_energy_kwh": 0.0, "grid_purchase_energy_kwh": 0.322222,
+       "soc_start_kwh": 0.0, "soc_end_kwh": 0.2},
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.0,
+       "discharge_ac_energy_kwh": 0.09, "grid_purchase_energy_kwh": 0.01,
+       "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}
+    ]
+  }'
+# → {"accepted": true, "next_index": 2, "last_soc_end_kwh": 0.1, "status": "in_progress", ...}
+
+# 4. 网络重试：原样重发步骤 3 的同一请求 → 返回与首次完全一致的既有结果，不重复入库
+
+# 5. 同一起点但内容不同 → HTTP 409 {"error": "batch_conflict", ...}（并发上报仅一份生效）
+curl -s -X POST "http://localhost:8000/dispatch/sessions/$SESSION_ID/records" \
+  -H 'Content-Type: application/json' \
+  -d '{"start_index": 0, "records": [
+        {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.111111,
+         "discharge_ac_energy_kwh": 0.0, "grid_purchase_energy_kwh": 0.211111,
+         "soc_start_kwh": 0.0, "soc_end_kwh": 0.1}
+      ]}'
+
+# 6. 追加第二批（start_index=2，首态 0.1 接已保存末态）→ 满期 completed
+curl -s -X POST "http://localhost:8000/dispatch/sessions/$SESSION_ID/records" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_index": 2,
+    "records": [
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.0,
+       "discharge_ac_energy_kwh": 0.09, "grid_purchase_energy_kwh": 0.01,
+       "soc_start_kwh": 0.1, "soc_end_kwh": 0.0},
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.0,
+       "discharge_ac_energy_kwh": 0.0, "grid_purchase_energy_kwh": 0.1,
+       "soc_start_kwh": 0.0, "soc_end_kwh": 0.0}
+    ]
+  }'
+# → {"accepted": true, "next_index": 4, "status": "completed", ...}
+
+# 7. 查询会话：原计划信息、连续已确认记录、下一下标
+curl -s "http://localhost:8000/dispatch/sessions/$SESSION_ID"
+
+# 8. 查询结果直接衔接现有接口：满期 → 结算；未满期 → 续排
+python3 - "$SESSION_ID" <<'PY'
+import json, sys, urllib.request
+
+sid = sys.argv[1]
+state = json.load(urllib.request.urlopen(f"http://localhost:8000/dispatch/sessions/{sid}"))
+if state["ready_for_settlement"]:          # 满期：直接结算
+    url = "http://localhost:8000/dispatch/settlement"
+    body = {
+        "dispatch": state["dispatch"],
+        "plan_snapshot": state["plan_snapshot"],
+        "settlement_tolerance_kwh": state["audit_tolerance_kwh"],
+        "records": state["confirmed_records"],
+    }
+elif state["ready_for_replan"]:            # 未完成前缀：续排余段
+    url = "http://localhost:8000/dispatch/replan"
+    body = {
+        "dispatch": state["dispatch"],
+        "plan_snapshot": state["plan_snapshot"],
+        "audit_tolerance_kwh": state["audit_tolerance_kwh"],
+        "executed_records": state["confirmed_records"],
+        "remaining_prices": [1.0, 0.0],    # 余段新预测，按实际填写
+        "remaining_base_load_kw": [0.2, 0.2],
+        "remaining_pv_kw": [0.0, 0.0],
+    }
+else:
+    raise SystemExit("会话还没有已确认记录")
+req = urllib.request.Request(
+    url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+)
+print(urllib.request.urlopen(req).read().decode())
+PY
+```
+
+会话持久化于 SQLite（进程重启后记录仍在），重启服务后再执行步骤 7 仍能查到全部已确认记录，并可继续追加后续批次。
+
 ## 模型与假设
 
 - **时段**：固定 0.5 h；功率（kW）× 0.5 即该时段能量（kWh）。
@@ -613,6 +777,17 @@ curl -s -X POST http://localhost:8000/dispatch/replan \
 
 注意：已执行动作**偏离旧计划**本身不构成拒绝——只要实测记录自洽（含相邻记录 SOC 衔接），偏离只作为 `soc_gap_*` 与各费用差额信息返回，续排一律以实测末态为准。
 
+`/dispatch/sessions` 系列接口的拒绝情形：
+
+- 创建会话沿用 `plan_snapshot_mismatch` / `infeasible` / `invalid_input`（均 HTTP 422）；
+- `batch_index_gap`（422）：批次起始下标越过会话当前 `next_index`，存在下标跳跃；
+- `batch_out_of_range`（422）：批次覆盖的时段下标超出原计划范围；
+- `batch_audit_failed`（422）：批内任一记录未通过遥测审计，或批首首态未在容差内接原初始 SOC / 已保存末态 SOC——整批不入库；
+- `batch_conflict`（409）：起点落在已确认区间且与已保存批次内容不一致（内容不同的并发上报仅一份生效）；
+- `session_not_found`（404）：会话不存在。
+
+前三种与 `batch_audit_failed` 均为**整批不入库**：会话的 `next_index` 与已确认记录保持不变，修正后可从下标 `next_index` 起重新提交。
+
 ## 测试
 
 ```bash
@@ -620,4 +795,4 @@ pip install pytest httpx
 pytest tests/ -q
 ```
 
-覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。
+覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建会话（快照重算核对、快照篡改与无解拒绝、非法容差拦截）、按序追加与查询（全局下标审计结论、进度与状态迁移）、首批首态接原初始 SOC 与后续批次首态接已保存末态（含等于容差边界通过）、偏离计划但自洽照收、下标跳跃 / 超出计划范围 / 批内异常整批拒绝且不入库、同一起点整批原样重试返回既有结果（含满期批次）、内容不同（含并发）仅一份生效其余 409、会话不存在 404、未完成前缀接 `/dispatch/replan` 与满期记录接 `/dispatch/settlement` 的端到端衔接、重开 SQLite 文件（等价进程重启）后记录与进度仍在且可继续追加，以及既有接口行为不变。

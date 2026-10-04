@@ -5,6 +5,12 @@ services:
     container_name: home-storage-dispatch
     ports:
       - "8000:8000"
+    environment:
+      # 执行会话的 SQLite 持久化位置（默认 data/sessions.db，相对工作目录 /app）
+      SESSION_DB_PATH: /app/data/sessions.db
+    volumes:
+      # 命名卷保存执行会话：容器重建 / 进程重启后记录仍在
+      - session-data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
@@ -12,3 +18,6 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+volumes:
+  session-data:

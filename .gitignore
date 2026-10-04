@@ -6,3 +6,5 @@ venv/
 .pylibs/
 *.egg-info/
 .DS_Store
+# 执行会话的本地 SQLite 数据（SESSION_DB_PATH 默认 data/sessions.db）
+data/
